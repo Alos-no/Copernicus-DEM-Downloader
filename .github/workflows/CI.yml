@@ -52,8 +52,48 @@ jobs:
         # Restore is required even with --no-build so the test runner can locate packages
         run: dotnet restore CopernicusDemDownloader.sln
 
-      - name: Run tests
+      - name: Validate Required Secrets for Integration Tests
+        # Fail early if any required secrets are missing on main/develop branches.
+        # This prevents tests from running with missing credentials which would cause
+        # confusing failures or, worse, tests that silently skip.
+        if: github.ref_name == 'main' || github.ref_name == 'develop'
+        env:
+          CDSE_ACCESS_KEY: ${{ secrets.CDSE_ACCESS_KEY }}
+          CDSE_SECRET_KEY: ${{ secrets.CDSE_SECRET_KEY }}
+        run: |
+          missing_secrets=()
+
+          [ -z "$CDSE_ACCESS_KEY" ] && missing_secrets+=("CDSE_ACCESS_KEY")
+          [ -z "$CDSE_SECRET_KEY" ] && missing_secrets+=("CDSE_SECRET_KEY")
+
+          if [ ${#missing_secrets[@]} -ne 0 ]; then
+            echo "::error::Missing required secrets for integration tests: ${missing_secrets[*]}"
+            echo ""
+            echo "The following secrets must be configured in GitHub repository settings:"
+            for secret in "${missing_secrets[@]}"; do
+              echo "  - $secret"
+            done
+            echo ""
+            echo "See README.md for instructions on obtaining CDSE S3 credentials."
+            exit 1
+          fi
+
+          echo "✓ All required secrets are configured"
+
+      - name: Run All Tests on Main/Develop Branch (Unit and Integration)
+        # Runs the full test suite, including live integration tests.
+        # This step REQUIRES the secrets to be configured in the repository.
+        if: github.ref_name == 'main' || github.ref_name == 'develop'
         run: dotnet test CopernicusDemDownloader.sln --no-build --verbosity normal --logger trx --results-directory ./test-results
+        env:
+          CDSE_ACCESS_KEY: ${{ secrets.CDSE_ACCESS_KEY }}
+          CDSE_SECRET_KEY: ${{ secrets.CDSE_SECRET_KEY }}
+
+      - name: Run Unit Tests Only (Pull Requests)
+        # On pull requests from forks or non-protected branches, run only unit tests
+        # since integration test secrets are not available.
+        if: github.ref_name != 'main' && github.ref_name != 'develop'
+        run: dotnet test CopernicusDemDownloader.sln --no-build --verbosity normal --filter "Category!=Integration&Category!=EndToEnd" --logger trx --results-directory ./test-results
 
       - name: Upload test results
         # Upload test results even if tests fail for debugging purposes
