@@ -1,0 +1,181 @@
+# GitHub Actions workflow for publishing releases.
+#
+# This workflow automates the release process for CopernicusDemDownloader:
+# 1. Triggers only after CI workflow passes on main branch
+# 2. Extracts version from the .csproj file
+# 3. Checks if a release for that version already exists (skips if so)
+# 4. Builds self-contained single-file executables for multiple platforms
+# 5. Creates a GitHub release with the binaries attached
+#
+# Triggers:
+# - Automatically after CI workflow succeeds on main branch
+# - Manual workflow dispatch (for testing or re-publishing)
+#
+# Published artifacts:
+# - CopernicusDemDownloader-win-x64.zip
+# - CopernicusDemDownloader-linux-x64.tar.gz
+# - CopernicusDemDownloader-osx-x64.tar.gz
+# - CopernicusDemDownloader-osx-arm64.tar.gz
+
+name: Publish Release
+
+on:
+  # Trigger after CI workflow completes on main branch
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+  # Allow manual trigger for testing or re-publishing
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build only, no release)'
+        required: false
+        default: false
+        type: boolean
+
+# Restrict default permissions for security
+permissions:
+  contents: write  # Required for creating GitHub releases
+
+# Allow only one concurrent publish to prevent race conditions
+concurrency:
+  group: "release-publish"
+  cancel-in-progress: false
+
+env:
+  PROJECT_PATH: src/CopernicusDemDownloader/CopernicusDemDownloader.csproj
+  OUTPUT_NAME: CopernicusDemDownloader
+
+jobs:
+  # Check if we should proceed with the release
+  check-version:
+    # Only run if CI succeeded (for workflow_run trigger) or for other triggers
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      should_release: ${{ steps.check-release.outputs.should_release }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Get version from csproj
+        id: get-version
+        run: |
+          VERSION=$(grep -oPm1 "(?<=<Version>)[^<]+" ${{ env.PROJECT_PATH }})
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if release exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.get-version.outputs.version }}"
+
+          # Check if release already exists
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists, skipping"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release v$VERSION does not exist, proceeding"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+  # Build for all platforms
+  build-release:
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        include:
+          - rid: win-x64
+            archive_type: zip
+            artifact_suffix: win-x64.zip
+          - rid: linux-x64
+            archive_type: tar
+            artifact_suffix: linux-x64.tar.gz
+          - rid: osx-x64
+            archive_type: tar
+            artifact_suffix: osx-x64.tar.gz
+          - rid: osx-arm64
+            archive_type: tar
+            artifact_suffix: osx-arm64.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Publish for ${{ matrix.rid }}
+        run: |
+          dotnet publish ${{ env.PROJECT_PATH }} \
+            --configuration Release \
+            --runtime ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            --output ./publish/${{ matrix.rid }}
+
+      - name: Create archive (zip)
+        if: matrix.archive_type == 'zip'
+        run: |
+          cd ./publish/${{ matrix.rid }}
+          zip -r ../../${{ env.OUTPUT_NAME }}-${{ matrix.artifact_suffix }} .
+
+      - name: Create archive (tar.gz)
+        if: matrix.archive_type == 'tar'
+        run: |
+          cd ./publish/${{ matrix.rid }}
+          tar -czvf ../../${{ env.OUTPUT_NAME }}-${{ matrix.artifact_suffix }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.OUTPUT_NAME }}-${{ matrix.artifact_suffix }}
+          path: ${{ env.OUTPUT_NAME }}-${{ matrix.artifact_suffix }}
+          retention-days: 1
+
+  # Create GitHub release with all artifacts
+  create-release:
+    needs: [check-version, build-release]
+    if: ${{ needs.check-version.outputs.should_release == 'true' && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la ./artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            ./artifacts/${{ env.OUTPUT_NAME }}-win-x64.zip
+            ./artifacts/${{ env.OUTPUT_NAME }}-linux-x64.tar.gz
+            ./artifacts/${{ env.OUTPUT_NAME }}-osx-x64.tar.gz
+            ./artifacts/${{ env.OUTPUT_NAME }}-osx-arm64.tar.gz
